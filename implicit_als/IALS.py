@@ -2,20 +2,54 @@ import numpy as np
 from sklearn.metrics import mean_squared_error
 from itertools import product
 import pickle
+from datetime import datetime
 
 class IALS:
     '''
     Based on the paper http://yifanhu.net/PUB/cf.pdf
     '''
+    @staticmethod
+    def __standard_confidence(R, alpha, eps):
+        return np.ones(R.shape) + alpha * R
 
-    def __init__(self, max_epoch=10, embedding_size=15, alpha=10, l2reg=0.1, random_state=42, verbose=1):
+    @staticmethod
+    def __log_confidence(R, alpha, eps):
+        return np.ones(R.shape) + alpha * np.log(np.ones(R.shape) + R / eps)
+
+    def __init__(self, max_epoch=10, embedding_size=15, alpha=10, l2reg=0.1, log_confidence=True, eps=0.1, random_state=42, verbose=1,
+                 show_real_metric=False):
         self.max_epoch = max_epoch
         self.embedding_size = embedding_size
         self.alpha = alpha
         self.l2reg = l2reg
         self.random_state = random_state
         self.verbose = verbose
+        self.show_real_metric = show_real_metric
+        self.eps = eps
+        self.log_confidence = log_confidence
+        if self.log_confidence:
+            self.confidence_func = self.__log_confidence
+        else:
+            self.confidence_func = self.__standard_confidence
         np.random.seed(self.random_state)
+
+    def eval_metrics(self, epoch, result, R_train, R_test, X, Y, C, gamma, beta, mean, subtract_mean, gr_mask, verbose):
+        str_out = "Epoch {}\ttrain\t".format(epoch)
+        train_error = np.sqrt(((result * gr_mask - R_train) ** 2).sum() / gr_mask.sum())
+        str_out += str(train_error)
+        if R_test is not None:
+            test_error = np.sqrt(((result * (R_test > 0) - R_test) ** 2).sum() / (R_test > 0).sum())
+            str_out += "\ttest\t{}".format(test_error)
+        else:
+            test_error = None
+        if self.show_real_metric:
+            metric = 1.0/(R.shape[0] * R.shape[1]) * \
+                                  (C * (R - mean * subtract_mean - beta - gamma) ** 2).sum() + self.l2reg * \
+                                  ((X**2).sum() + (Y**2).sum() + (beta**2).sum() + (gamma**2).sum())
+            str_out += "\tmetric\t{}".format(metric)
+        if verbose > 0:
+            print(str_out)
+        return train_error, test_error
 
     def fit(self, R_train, R_test=None):
         '''
@@ -30,10 +64,13 @@ class IALS:
         eq_mask = R_train == 0
         mean = R_train[gr_mask].mean()
         # We either add mean to unknown values or subtract it from known and add it at the end
-        #P = R_train + eq_mask * mean
-        P = R - gr_mask * mean
+        subtract_mean = False
+        if subtract_mean:
+            P = R - gr_mask * mean
+        else:
+            P = R_train + eq_mask * mean
         # Precompute C and (C - 1) matrices
-        C = np.ones(R_train.shape) + self.alpha * R_train  # fixed
+        C = self.confidence_func(R_train, self.alpha, self.eps)
         Cm1 = C - 1
 
         laI = np.eye(self.embedding_size + 1, self.embedding_size + 1) * self.l2reg  # fixed
@@ -70,22 +107,13 @@ class IALS:
                 Y[j, :] = np.matmul(inv_mat_to_x, Cp[:, j].reshape(-1, 1)).ravel()
             gamma = Y[:, 0].copy().reshape(1, -1)
             Y[:, 0] = 1
-            epoch_result = np.matmul(X[:, 1:], Y[:, 1:].T) + beta + gamma + mean
+            epoch_result = np.matmul(X[:, 1:], Y[:, 1:].T) + beta + gamma + mean * subtract_mean
             if self.verbose > 0:
                 if epoch % self.verbose == 0:
-                    train_error = ((epoch_result * gr_mask - R_train) ** 2).sum() / gr_mask.sum()
-                    if R_test is not None:
-                        test_error = ((epoch_result * (R_test > 0) - R_test) ** 2).sum() / (R_test > 0).sum()
-                        print("Epoch {}\ttrain\t{}\ttest\t{}".format(epoch, train_error, test_error))
-                    else:
-                        print("Epoch {} train error: {}".format(epoch, train_error))
-        train_error = ((epoch_result * gr_mask - R_train) ** 2).sum() / gr_mask.sum()
-        if R_test is not None:
-            test_error = ((epoch_result * (R_test > 0) - R_test) ** 2).sum() / (R_test > 0).sum()
-        else:
-            test_error = -1
-        if self.verbose > 0:
-            print("Epoch {}\ttrain\t{}\ttest\t{}".format(epoch, train_error, test_error))
+                    self.eval_metrics(epoch, epoch_result, R_train, R_test, X, Y, C,
+                                      gamma, beta, mean, subtract_mean, gr_mask, self.verbose)
+        train_error, test_error = self.eval_metrics(epoch, epoch_result, R_train, R_test, X, Y, C,
+                                      gamma, beta, mean, subtract_mean, gr_mask, self.verbose)
         return epoch_result, train_error, test_error
 
 
@@ -113,14 +141,14 @@ def train_test_split(R, test_ratio=0.1, random_state=None):
 if __name__ == "__main__":
     R = np.load("data/train.npy")
     cross_validation = False
-    submit = True
+    submit = False
     submission_name = "data/submission.txt"
-
+    start_time = datetime.now()
     if cross_validation:
         seeds = [13, 42, 777, 1234, 1000000]
         splits = [train_test_split(R, 0.1, seed) for seed in seeds]
         alphas = list(range(5, 19, 2))
-        l2regs = [0.1, 0.01]
+        l2regs = [0.01]
         emb_sizes = list(range(5, 11))
         results = dict()
         for l2reg, emb_size, alpha in product(l2regs, emb_sizes, alphas):
@@ -133,7 +161,8 @@ if __name__ == "__main__":
         pickle.dump(results, "data/cv_pickle")
     else:
         R_train, R_test = train_test_split(R, 0.1, 1234)
-        ials = IALS(max_epoch=100, embedding_size=5, alpha=13, verbose=10)
+        ials = IALS(max_epoch=100, embedding_size=4, alpha=7, verbose=30, l2reg=0.1, eps=0.08,
+                    log_confidence=True, show_real_metric=False)
         if submit:
             res, _, _ = ials.fit(R)
             with open("data/test.txt", 'r') as file_in:
@@ -144,5 +173,5 @@ if __name__ == "__main__":
                         assert len(ui) == 2
                         file_out.write("{},{}\n".format(id + 1, res[ui[0] - 1, ui[1] - 1]))
         else:
-            print((R_train > 0).sum(), (R_test>0).sum())
             res = ials.fit(R_train, R_test)
+            print("Time elapsed: {}".format(datetime.now() - start_time))
